@@ -2,86 +2,82 @@ package main
 
 import (
 	"log"
-	"net/http"
+	"os"
 	"time"
-    "crypto/tls"
-	"github.com/IBM/sarama"
+
+	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/linkedin/goavro/v2"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/push"
 )
 
-var (
-	kafkaBroker   = "pkc-6ojv2.us-west4.gcp.confluent.cloud:9092"
-	kafkaTopic    = "final_latency_data"
-	schemaRegistryURL = "https://psrc-4nyjd.us-central1.gcp.confluent.cloud"
-	consumerGroup = "my-consumer-group"
-	schemaSubject = "KsqlDataSourceSchema"
-)
-
 func main() {
+	// Load configuration from environment variables
+	kafkaBroker := os.Getenv("KAFKA_BROKER")
+	kafkaTopic := os.Getenv("KAFKA_TOPIC")
+	//schemaRegistryUserInfo := os.Getenv("SCHEMA_REGISTRY_USER_INFO")
+	//schemaRegistryURL := os.Getenv("SCHEMA_REGISTRY_URL")
+	saslUsername := os.Getenv("SASL_USERNAME")
+	saslPassword := os.Getenv("SASL_PASSWORD")
+	promPushGatewayURL := os.Getenv("PROM_PUSHGATEWAY_URL")
+	jobName := os.Getenv("JOB_NAME")
+
 	// Set up Avro schema decoder
 	codec, err := goavro.NewCodec(`
-		{
-			"type": "record",
-			"name": "KsqlDataSourceSchema",
-			"namespace": "io.confluent.ksql.avro_schemas",
-			"fields": [
-				{
-					"name": "TS",
-					"type": ["null", "long"]
-				},
-				{
-					"name": "CORRELATION_ID",
-					"type": ["null", "string"]
-				},
-				{
-					"name": "CONNECT_PIPELINE_ID",
-					"type": ["null", "string"]
-				},
-				{
-					"name": "E2E_LATENCY",
-					"type": ["null", "long"]
-				}
-			]
-		}
-	`)
+	{
+		"type": "record",
+		"name": "KsqlDataSourceSchema",
+		"namespace": "io.confluent.ksql.avro_schemas",
+		"fields": [
+			{
+				"name": "TS",
+				"type": ["null", "long"]
+			},
+			{
+				"name": "CORRELATION_ID",
+				"type": ["null", "string"]
+			},
+			{
+				"name": "CONNECT_PIPELINE_ID",
+				"type": ["null", "string"]
+			},
+			{
+				"name": "E2E_LATENCY",
+				"type": ["null", "long"]
+			}
+		]
+	}
+`)
 	if err != nil {
 		log.Fatal("Avro schema error:", err)
 	}
 
 	// Set up Kafka consumer config
-	config := sarama.NewConfig()
-	config.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategySticky
-	config.Consumer.Offsets.Initial = sarama.OffsetOldest
-	config.Version = sarama.V2_4_0_0 // Set the appropriate Kafka version
-
-	// Configure SASL and TLS for secure connection
-	config.Net.SASL.Enable = true
-	config.Net.SASL.User = "72X53X5NBUPSITYT"
-	config.Net.SASL.Password = "dYKiX5YD+ON4cA8tZys1d51Bhf62WHqGbpO7kovD1EI84XXNXUjquLAsir3NRtKs"
-	config.Net.SASL.Mechanism = sarama.SASLMechanism("PLAIN")
-	config.Net.SASL.Handshake = true
-	config.Net.TLS.Enable = true
-	config.Net.TLS.Config = &tls.Config{
-		InsecureSkipVerify: true, // Skip certificate verification for simplicity, but it's not recommended in production.
+	config := kafka.ConfigMap{
+		"bootstrap.servers": kafkaBroker,
+		"group.id":          "my-consumer-group",
+		"auto.offset.reset": "earliest",
+		"sasl.mechanisms":   "PLAIN",
+		"sasl.username":     saslUsername,
+		"sasl.password":     saslPassword,
+		"security.protocol": "sasl_ssl",
 	}
 
-	consumer, err := sarama.NewConsumer([]string{kafkaBroker}, config)
+	consumer, err := kafka.NewConsumer(&config)
 	if err != nil {
 		log.Fatal("Kafka consumer error:", err)
 	}
 	defer consumer.Close()
 
-	partitionConsumer, err := consumer.ConsumePartition(kafkaTopic, 0, sarama.OffsetNewest)
+	err = consumer.SubscribeTopics([]string{kafkaTopic}, nil)
 	if err != nil {
-		log.Fatal("Kafka partition consumer error:", err)
+		log.Fatal("Kafka subscription error:", err)
 	}
-	defer partitionConsumer.Close()
 
 	// Set up Prometheus Push Gateway client
-	pusher := push.New("http://localhost:9091", "kafka_connect_pipeline_e2e_latency")
+	pushURL := promPushGatewayURL + "/metrics/job/" + jobName
+
+	pusher := push.New(pushURL, jobName)
 
 	// Define Prometheus gauge metric for E2E_LATENCY
 	e2eLatencyGauge := prometheus.NewGaugeVec(
@@ -99,43 +95,37 @@ func main() {
 	go func() {
 		for {
 			select {
-			case msg := <-partitionConsumer.Messages():
-				// Decode Avro message
-				native, _, err := codec.NativeFromBinary(msg.Value)
-				if err != nil {
-					log.Println("Avro decoding error:", err)
-					continue
+			case ev := <-consumer.Events():
+				switch e := ev.(type) {
+				case *kafka.Message:
+					// Decode Avro message
+					native, _, err := codec.NativeFromBinary(e.Value)
+					if err != nil {
+						log.Println("Avro decoding error:", err)
+						continue
+					}
+
+					record := native.(map[string]interface{})
+					ts := time.Unix(0, record["TS"].(int64))
+					correlationID := record["CORRELATION_ID"].(string)
+					connectPipelineID := record["CONNECT_PIPELINE_ID"].(string)
+					e2eLatency := float64(record["E2E_LATENCY"].(int64))
+
+					// Update Prometheus metric
+					e2eLatencyGauge.WithLabelValues(correlationID, connectPipelineID).Set(e2eLatency)
+
+					log.Printf("Pushing metric: CORRELATION_ID=%s, CONNECT_PIPELINE_ID=%s, TS=%s, E2E_LATENCY=%.2f\n",
+						correlationID, connectPipelineID, ts, e2eLatency)
+
+				case kafka.Error:
+					log.Println("Kafka consumer error:", e)
 				}
-
-				record := native.(map[string]interface{})
-				ts := time.Unix(0, record["TS"].(int64))
-				correlationID := record["CORRELATION_ID"].(string)
-				connectPipelineID := record["CONNECT_PIPELINE_ID"].(string)
-				e2eLatency := float64(record["E2E_LATENCY"].(int64))
-
-				// Update Prometheus metric
-				e2eLatencyGauge.WithLabelValues(correlationID, connectPipelineID).Set(e2eLatency)
-
-				// Push the metric to Prometheus Push Gateway
-				if err := pusher.Collector(e2eLatencyGauge).Push(); err != nil {
-					log.Println("Prometheus Push Gateway error:", err)
-				}
-
-				log.Printf("Pushed metric: CORRELATION_ID=%s, CONNECT_PIPELINE_ID=%s, TS=%s, E2E_LATENCY=%.2f\n",
-					correlationID, connectPipelineID, ts, e2eLatency)
-
-			case err := <-partitionConsumer.Errors():
-				log.Println("Kafka consumer error:", err)
 			}
 		}
 	}()
 
-	// Expose Prometheus metrics for scraping on port 9091
-	http.Handle("/metrics", promhttp.Handler())
-	go func() {
-		http.ListenAndServe(":9091", nil)
-	}()
-
-	// Keep the program running
-	select {}
+	// Push metrics to Prometheus Push Gateway (moved outside the loop)
+	if err := pusher.Collector(e2eLatencyGauge).Push(); err != nil {
+		log.Println("Prometheus Push Gateway error:", err)
+	}
 }

@@ -7,6 +7,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/confluentinc/confluent-kafka-go v1.9.2 // indirect
+	github.com/datamountaineer/schema-registry v0.0.0-20190327143759 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/eapache/go-resiliency v1.4.0 // indirect
 	github.com/eapache/go-xerial-snappy v0.0.0-20230731223053-c322873962e3 // indirect
